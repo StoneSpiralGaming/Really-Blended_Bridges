@@ -1,0 +1,2 @@
+Pillow>=10
+esplib @ git+https://github.com/BadDogSkyrim/esplib.git@7a24a5a7906ab9eb227a039d6e2b191229045f46

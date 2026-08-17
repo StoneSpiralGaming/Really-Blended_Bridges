@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.spec
+build/
+dist/
+*.exe
+*.zip
+*.7z
+*.dds
+*.nif
+*.esp
+*.preferences.json
+.venv/
+venv/
+.idea/
+.vscode/
