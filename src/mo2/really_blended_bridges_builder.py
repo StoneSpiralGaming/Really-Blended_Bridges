@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import configparser
+import ctypes
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -53,6 +55,17 @@ class Variant:
         return Path("textures") / "landscape" / f"{self.source_stem}_n.dds"
 
 
+@dataclass(frozen=True)
+class MO2Directories:
+    """Resolved storage directories for one MO2 instance."""
+
+    instance: Path
+    base: Path
+    mods: Path
+    profiles: Path
+    overwrite: Path
+
+
 VARIANTS = (
     Variant("dirt02", "Default", "dirt02", "rbb_dirt02", "RBB_Dirt02"),
     Variant("snow01", "Snow", "snow01", "rbb_snow01", "RBB_Snow01"),
@@ -84,15 +97,66 @@ def qt_ini_path(value: str) -> str:
     return value.replace("\\\\", "\\")
 
 
-def read_mo2_ini(mo2_root: Path) -> tuple[str, Path | None]:
+def read_ini_parser(mo2_root: Path) -> configparser.ConfigParser:
     parser = configparser.ConfigParser(interpolation=None, strict=False)
     parser.optionxform = str
     ini = mo2_root / "ModOrganizer.ini"
-    if not ini.is_file():
-        return "", None
-    parser.read(ini, encoding="utf-8-sig")
-    selected = qt_ini_path(parser.get("General", "selected_profile", fallback=""))
-    game_value = qt_ini_path(parser.get("General", "gamePath", fallback=""))
+    if ini.is_file():
+        parser.read(ini, encoding="utf-8-sig")
+    return parser
+
+
+def ini_value(parser: configparser.ConfigParser, section_name: str, option_name: str) -> str:
+    """Read a Qt INI value without depending on section or option casing."""
+    wanted_section = section_name.casefold()
+    wanted_option = option_name.casefold()
+    for section in parser.sections():
+        if section.casefold() != wanted_section:
+            continue
+        for option, value in parser.items(section, raw=True):
+            if option.casefold() == wanted_option:
+                return qt_ini_path(value)
+    return ""
+
+
+def resolve_mo2_directory(value: str, relative_to: Path, base_dir: Path | None = None) -> Path:
+    """Expand an MO2 path setting, including its %BASE_DIR% placeholder."""
+    expanded = qt_ini_path(value).strip()
+    if base_dir:
+        expanded = re.sub(r"%BASE_DIR%", lambda _match: str(base_dir), expanded, flags=re.IGNORECASE)
+    expanded = os.path.expandvars(os.path.expanduser(expanded))
+    path = Path(expanded)
+    if not path.is_absolute():
+        path = relative_to / path
+    return Path(os.path.normpath(path))
+
+
+def read_mo2_directories(mo2_root: Path) -> MO2Directories:
+    """Resolve MO2's configurable storage paths with portable-layout fallbacks."""
+    instance = Path(os.path.normpath(mo2_root))
+    parser = read_ini_parser(instance)
+    base_value = ini_value(parser, "Settings", "base_directory")
+    base = resolve_mo2_directory(base_value, instance) if base_value else instance
+
+    def configured(option: str, fallback_name: str) -> Path:
+        value = ini_value(parser, "Settings", option)
+        if not value:
+            return base / fallback_name
+        return resolve_mo2_directory(value, base, base)
+
+    return MO2Directories(
+        instance=instance,
+        base=base,
+        mods=configured("mod_directory", "mods"),
+        profiles=configured("profiles_directory", "profiles"),
+        overwrite=configured("overwrite_directory", "overwrite"),
+    )
+
+
+def read_mo2_ini(mo2_root: Path) -> tuple[str, Path | None]:
+    parser = read_ini_parser(mo2_root)
+    selected = ini_value(parser, "General", "selected_profile")
+    game_value = ini_value(parser, "General", "gamePath")
     return selected, Path(game_value) if game_value else None
 
 
@@ -107,47 +171,130 @@ def load_preferences() -> dict:
     return {}
 
 
+def parent_process_directories() -> list[Path]:
+    """Return executable directories in this process's Windows parent chain."""
+    if os.name != "nt":
+        return []
+    try:
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = (
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = (
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        invalid_handle = ctypes.c_void_p(-1).value
+        if snapshot == invalid_handle:
+            return []
+        parents: dict[int, int] = {}
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        try:
+            if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                while True:
+                    parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+                    if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                        break
+        finally:
+            kernel32.CloseHandle(snapshot)
+
+        directories: list[Path] = []
+        process_id = os.getpid()
+        for _depth in range(8):
+            process_id = parents.get(process_id, 0)
+            if not process_id:
+                break
+            process = kernel32.OpenProcess(0x1000, False, process_id)
+            if not process:
+                continue
+            try:
+                buffer = ctypes.create_unicode_buffer(32768)
+                size = wintypes.DWORD(len(buffer))
+                if kernel32.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(size)):
+                    directories.append(Path(buffer.value).parent)
+            finally:
+                kernel32.CloseHandle(process)
+        return directories
+    except (AttributeError, OSError, ValueError):
+        return []
+
+
 def discover_mo2_root(preferred: str = "") -> Path | None:
     candidates: list[Path] = []
     if preferred:
         candidates.append(Path(preferred))
-    candidates.extend((APP_DIR, *list(APP_DIR.parents)[:4]))
-    candidates.append(DEFAULT_MO2)
-    for letter in "CDEFG":
-        drive = Path(f"{letter}:\\")
-        candidates.extend(
-            (
-                drive / "Modding Tools" / "MO2 - SME",
-                drive / "Modding Tools" / "MO2",
-                drive / "MO2",
-                drive / "Mod Organizer 2",
-            )
-        )
+    candidates.extend((APP_DIR, *list(APP_DIR.parents)[:4], Path.cwd(), *list(Path.cwd().parents)[:4]))
+    candidates.extend(parent_process_directories())
+    if DEFAULT_MO2 != APP_DIR:
+        candidates.append(DEFAULT_MO2)
+    for environment_name in ("LOCALAPPDATA", "APPDATA"):
+        environment_root = os.environ.get(environment_name)
+        if not environment_root:
+            continue
+        instances_root = Path(environment_root) / "ModOrganizer"
+        candidates.append(instances_root)
+        if instances_root.is_dir():
+            try:
+                candidates.extend(path for path in instances_root.iterdir() if path.is_dir())
+            except OSError:
+                pass
     seen = set()
     for candidate in candidates:
         key = str(candidate).lower()
         if key in seen:
             continue
         seen.add(key)
-        if (candidate / "ModOrganizer.ini").is_file() and (candidate / "profiles").is_dir() and (candidate / "mods").is_dir():
+        directories = read_mo2_directories(candidate)
+        if (candidate / "ModOrganizer.ini").is_file() and directories.profiles.is_dir() and directories.mods.is_dir():
             return candidate
     return None
 
 
 def default_output_folder(mo2_root: Path | None) -> Path:
-    if mo2_root and (mo2_root / "mods").is_dir():
-        return mo2_root / "mods" / "Really Blended Bridges"
+    if mo2_root:
+        mods_directory = read_mo2_directories(mo2_root).mods
+        if mods_directory.is_dir():
+            return mods_directory / "Really Blended Bridges"
     return DEFAULT_OUTPUT_MOD
 
 
 def enabled_mod_roots(mo2_root: Path, profile_name: str) -> list[Path]:
     """Return loose-file roots in MO2 winning order (highest priority first)."""
-    roots = [mo2_root / "overwrite"]
-    modlist = mo2_root / "profiles" / profile_name / "modlist.txt"
+    directories = read_mo2_directories(mo2_root)
+    roots = [directories.overwrite]
+    modlist = directories.profiles / profile_name / "modlist.txt"
     if modlist.is_file():
         for raw in modlist.read_text(encoding="utf-8-sig", errors="replace").splitlines():
             if raw.startswith("+"):
-                roots.append(mo2_root / "mods" / raw[1:])
+                roots.append(directories.mods / raw[1:])
     _selected, game_root = read_mo2_ini(mo2_root)
     if game_root:
         roots.append(game_root / "Data")
@@ -180,10 +327,7 @@ def find_texconv(mo2_root: Path | None = None) -> Path | None:
     located = shutil.which("texconv.exe") or shutil.which("texconv")
     if located:
         return Path(located)
-    guesses = [
-        Path(r"C:\Program Files (x86)\Steam\steamapps\common\Fallout 4\Tools\Elric\texconv.exe"),
-        Path(r"C:\Program Files\Steam\steamapps\common\Fallout 4\Tools\Elric\texconv.exe"),
-    ]
+    guesses: list[Path] = []
     if mo2_root:
         guesses.extend((mo2_root / "tools" / "texconv.exe", mo2_root / "tools" / "Cathedral Assets Optimizer" / "resources" / "texconv.exe"))
     found = next((path for path in guesses if path.is_file()), None)
@@ -481,10 +625,11 @@ class ReallyBlendedBridgesBuilder(Tk):
         self.profile_var = StringVar(value=str(saved.get("profile", selected_profile)))
         self.template_var = StringVar(value=str(saved.get("template", "")))
         saved_output = str(saved.get("output", ""))
+        configured_mods = read_mo2_directories(mo2_root).mods if mo2_root else None
         legacy_outputs = (
-            mo2_root / "mods" / "BridgeDirtRegionalPatch",
-            mo2_root / "mods" / "Bridge Dirt Regional Patch",
-        ) if mo2_root else ()
+            configured_mods / "BridgeDirtRegionalPatch",
+            configured_mods / "Bridge Dirt Regional Patch",
+        ) if configured_mods else ()
         if saved_output and any(saved_output.lower() == str(path).lower() for path in legacy_outputs):
             saved_output = ""
         self.output_var = StringVar(value=saved_output or str(default_output_folder(mo2_root)))
@@ -793,7 +938,7 @@ class ReallyBlendedBridgesBuilder(Tk):
 
     def refresh_profiles(self) -> None:
         root = Path(self.mo2_var.get())
-        profiles_root = root / "profiles"
+        profiles_root = read_mo2_directories(root).profiles
         profiles = sorted(path.name for path in profiles_root.iterdir() if path.is_dir()) if profiles_root.is_dir() else []
         self.profile_combo["values"] = profiles
         selected, _game = read_mo2_ini(root)
@@ -802,7 +947,7 @@ class ReallyBlendedBridgesBuilder(Tk):
 
     def _winning_mod_name(self, path: Path, mo2_root: Path) -> str:
         try:
-            return path.relative_to(mo2_root / "mods").parts[0]
+            return path.relative_to(read_mo2_directories(mo2_root).mods).parts[0]
         except ValueError:
             if "overwrite" in [part.lower() for part in path.parts]:
                 return "MO2 Overwrite"
@@ -1019,10 +1164,51 @@ class ReallyBlendedBridgesBuilder(Tk):
             self.update_readiness()
 
 
+def directory_resolution_self_test() -> None:
+    with tempfile.TemporaryDirectory(prefix="rbb_mo2_paths_") as temp_name:
+        temp_root = Path(temp_name)
+        instance = temp_root / "instance"
+        base = temp_root / "storage"
+        mods = temp_root / "external mods"
+        game = temp_root / "game"
+        profiles = base / "profiles"
+        overwrite = base / "overwrite"
+        for directory in (instance, mods, profiles / "Test Profile", overwrite):
+            directory.mkdir(parents=True, exist_ok=True)
+        (instance / "ModOrganizer.ini").write_text(
+            "[General]\n"
+            "selected_profile=@ByteArray(Test Profile)\n"
+            f"gamePath=@ByteArray({game.as_posix()})\n"
+            "[Settings]\n"
+            f"base_directory={base.as_posix()}\n"
+            f"mod_directory={mods.as_posix()}\n"
+            "profiles_directory=%BASE_DIR%/profiles\n"
+            "overwrite_directory=%BASE_DIR%/overwrite\n",
+            encoding="utf-8",
+        )
+        (profiles / "Test Profile" / "modlist.txt").write_text("+Landscape Test\n", encoding="utf-8")
+        asset = Path("textures") / "landscape" / "dirt02.dds"
+        source = mods / "Landscape Test" / asset
+        source.parent.mkdir(parents=True)
+        source.touch()
+
+        directories = read_mo2_directories(instance)
+        assert directories.base == base
+        assert directories.mods == mods
+        assert directories.profiles == profiles
+        assert directories.overwrite == overwrite
+        assert discover_mo2_root(str(instance)) == instance
+        winner, candidates = resolve_loose_asset(instance, "Test Profile", asset)
+        assert winner == source and source in candidates
+        assert default_output_folder(instance) == mods / "Really Blended Bridges"
+
+
 def self_test() -> None:
+    directory_resolution_self_test()
     configured_root = os.environ.get("RBB_TEST_MO2_ROOT")
     if not configured_root:
-        raise RuntimeError("Set RBB_TEST_MO2_ROOT to an MO2 instance before running --self-test")
+        print("MO2 directory resolution tests passed.")
+        return
     expected_root = Path(configured_root)
     discovered_mo2 = discover_mo2_root(str(expected_root))
     assert discovered_mo2 == expected_root
@@ -1030,16 +1216,17 @@ def self_test() -> None:
     assert selected
     template, _template_candidates = resolve_loose_asset(discovered_mo2, selected, SMIM_TEMPLATE_ASSET)
     assert template and template.is_file()
+    template_size = load_rgba(template).size
     winners = {}
     for variant in VARIANTS:
         diffuse, _ = resolve_loose_asset(discovered_mo2, selected, variant.diffuse_asset)
         normal, _ = resolve_loose_asset(discovered_mo2, selected, variant.normal_asset)
         assert diffuse and normal, variant.label
         winners[variant.key] = (diffuse, normal)
-        normal_strip, _normal_stats = make_vertical_strip(normal, (512, 2048))
-        assert normal_strip.size == (512, 2048)
+        normal_strip, _normal_stats = make_vertical_strip(normal, template_size)
+        assert normal_strip.size == template_size
     image, stats = build_diffuse(template, winners["dirt02"][0])
-    assert image.size == (512, 2048) == (stats["width"], stats["height"])
+    assert image.size == template_size == (stats["width"], stats["height"])
     skyrim_esm = find_skyrim_esm(discovered_mo2)
     assert skyrim_esm
     with tempfile.TemporaryDirectory(prefix="bridge_plugin_test_") as temp_name:
@@ -1052,7 +1239,7 @@ def self_test() -> None:
         test_dds = temp_root / "converter_test.dds"
         encode_bc3_with_mips(image, test_dds, converter)
         fourcc, mips, width, height = inspect_dds(test_dds)
-        assert (fourcc, width, height) == ("DXT5", 512, 2048)
+        assert (fourcc, width, height) == ("DXT5", *template_size)
         assert mips > 1
 
 
@@ -1076,7 +1263,7 @@ if __name__ == "__main__":
         assert _app.current_texconv() and _app.current_texconv().is_file()
         if bundled_texconv_path():
             assert _app.texconv_var.get() == BUNDLED_TEXCONV_LABEL
-        assert Path(_app.output_var.get()) == DEFAULT_MO2 / "mods" / "Really Blended Bridges"
+        assert Path(_app.output_var.get()) == read_mo2_directories(DEFAULT_MO2).mods / "Really Blended Bridges"
         assert Path(_app.template_var.get()).name.lower() == "smim_bridge_dirt.dds"
         _first, _last = _app.scroll_canvas.yview()
         assert _last < 1.0
@@ -1087,3 +1274,4 @@ if __name__ == "__main__":
         _app.destroy()
         raise SystemExit(0)
     ReallyBlendedBridgesBuilder().mainloop()
+
