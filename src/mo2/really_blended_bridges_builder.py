@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import configparser
-import ctypes
 import json
 import os
 import re
@@ -171,111 +170,93 @@ def load_preferences() -> dict:
     return {}
 
 
-def parent_process_directories() -> list[Path]:
-    """Return executable directories in this process's Windows parent chain."""
-    if os.name != "nt":
-        return []
-    try:
-        from ctypes import wintypes
-
-        class PROCESSENTRY32W(ctypes.Structure):
-            _fields_ = (
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.c_size_t),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", wintypes.LONG),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", wintypes.WCHAR * 260),
-            )
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
-        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-        kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
-        kernel32.Process32FirstW.restype = wintypes.BOOL
-        kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
-        kernel32.Process32NextW.restype = wintypes.BOOL
-        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.QueryFullProcessImageNameW.argtypes = (
-            wintypes.HANDLE,
-            wintypes.DWORD,
-            wintypes.LPWSTR,
-            ctypes.POINTER(wintypes.DWORD),
-        )
-        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
-        invalid_handle = ctypes.c_void_p(-1).value
-        if snapshot == invalid_handle:
-            return []
-        parents: dict[int, int] = {}
-        entry = PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(entry)
+def global_instance_roots() -> list[Path]:
+    """Return MO2's standard global-instance folders without broad searching."""
+    roots: list[Path] = []
+    environment_root = os.environ.get("LOCALAPPDATA")
+    if not environment_root:
+        return roots
+    instances_root = Path(environment_root) / "ModOrganizer"
+    if instances_root.is_dir():
         try:
-            if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
-                while True:
-                    parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
-                    if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
-                        break
-        finally:
-            kernel32.CloseHandle(snapshot)
-
-        directories: list[Path] = []
-        process_id = os.getpid()
-        for _depth in range(8):
-            process_id = parents.get(process_id, 0)
-            if not process_id:
-                break
-            process = kernel32.OpenProcess(0x1000, False, process_id)
-            if not process:
-                continue
-            try:
-                buffer = ctypes.create_unicode_buffer(32768)
-                size = wintypes.DWORD(len(buffer))
-                if kernel32.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(size)):
-                    directories.append(Path(buffer.value).parent)
-            finally:
-                kernel32.CloseHandle(process)
-        return directories
-    except (AttributeError, OSError, ValueError):
-        return []
+            roots.extend(path for path in instances_root.iterdir() if path.is_dir())
+        except OSError:
+            pass
+    return roots
 
 
-def discover_mo2_root(preferred: str = "") -> Path | None:
+def path_is_within(path: Path, directory: Path) -> bool:
+    try:
+        Path(os.path.abspath(path)).relative_to(Path(os.path.abspath(directory)))
+        return True
+    except ValueError:
+        return False
+
+
+def choose_mo2_candidate(
+    candidates: list[Path],
+    preferred: str = "",
+    application_dir: Path | None = None,
+) -> Path | None:
+    """Choose by builder ownership, then an explicit saved/manual preference."""
+    app_dir = application_dir or APP_DIR
+    preferred_path = Path(preferred) if preferred else None
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = Path(os.path.normpath(candidate))
+        key = os.path.normcase(str(normalized))
+        if key not in seen:
+            seen.add(key)
+            unique.append(normalized)
+
+    valid = []
+    for candidate in unique:
+        if not (candidate / "ModOrganizer.ini").is_file():
+            continue
+        directories = read_mo2_directories(candidate)
+        if directories.profiles.is_dir() and directories.mods.is_dir():
+            valid.append(candidate)
+    if not valid:
+        return None
+
+    owning = [candidate for candidate in valid if path_is_within(app_dir, read_mo2_directories(candidate).mods)]
+    if len(owning) == 1:
+        return owning[0]
+    if preferred_path in valid:
+        return preferred_path
+    return valid[0] if len(valid) == 1 else None
+
+
+def discover_mo2_candidates(preferred: str = "") -> list[Path]:
+    """Find only explicit, portable, and standard global MO2 configurations."""
     candidates: list[Path] = []
     if preferred:
         candidates.append(Path(preferred))
-    candidates.extend((APP_DIR, *list(APP_DIR.parents)[:4], Path.cwd(), *list(Path.cwd().parents)[:4]))
-    candidates.extend(parent_process_directories())
+    candidates.extend((APP_DIR, *APP_DIR.parents))
     if DEFAULT_MO2 != APP_DIR:
         candidates.append(DEFAULT_MO2)
-    for environment_name in ("LOCALAPPDATA", "APPDATA"):
-        environment_root = os.environ.get(environment_name)
-        if not environment_root:
-            continue
-        instances_root = Path(environment_root) / "ModOrganizer"
-        candidates.append(instances_root)
-        if instances_root.is_dir():
-            try:
-                candidates.extend(path for path in instances_root.iterdir() if path.is_dir())
-            except OSError:
-                pass
-    seen = set()
+    candidates.extend(global_instance_roots())
+
+    valid: list[Path] = []
+    seen: set[str] = set()
     for candidate in candidates:
-        key = str(candidate).lower()
+        normalized = Path(os.path.normpath(candidate))
+        key = os.path.normcase(str(normalized))
         if key in seen:
             continue
         seen.add(key)
-        directories = read_mo2_directories(candidate)
-        if (candidate / "ModOrganizer.ini").is_file() and directories.profiles.is_dir() and directories.mods.is_dir():
-            return candidate
-    return None
+        if not (normalized / "ModOrganizer.ini").is_file():
+            continue
+        directories = read_mo2_directories(normalized)
+        if directories.profiles.is_dir() and directories.mods.is_dir():
+            valid.append(normalized)
+    return valid
+
+
+def discover_mo2_root(preferred: str = "") -> Path | None:
+    candidates = discover_mo2_candidates(preferred)
+    return choose_mo2_candidate(candidates, preferred, APP_DIR)
 
 
 def default_output_folder(mo2_root: Path | None) -> Path:
@@ -333,19 +314,19 @@ def find_texconv(mo2_root: Path | None = None) -> Path | None:
     found = next((path for path in guesses if path.is_file()), None)
     if found:
         return found
-    tools_root = mo2_root / "tools" if mo2_root else None
-    if tools_root and tools_root.is_dir():
-        try:
-            return next((path for path in tools_root.rglob("texconv.exe") if path.is_file()), None)
-        except OSError:
-            pass
     return None
 
 
 def find_skyrim_esm(mo2_root: Path) -> Path | None:
     _profile, game_root = read_mo2_ini(mo2_root)
     guesses = [game_root / "Data" / "Skyrim.esm"] if game_root else []
-    guesses.append(mo2_root / "Stock Game" / "Data" / "Skyrim.esm")
+    directories = read_mo2_directories(mo2_root)
+    guesses.extend(
+        (
+            directories.base / "Stock Game" / "Data" / "Skyrim.esm",
+            mo2_root / "Stock Game" / "Data" / "Skyrim.esm",
+        )
+    )
     return next((path for path in guesses if path.is_file()), None)
 
 
@@ -619,11 +600,15 @@ class ReallyBlendedBridgesBuilder(Tk):
         preferences = load_preferences()
         use_saved = bool(preferences.get("remember", False)) and os.environ.get("RBB_UI_TEST") != "1"
         saved = preferences if use_saved else {}
-        mo2_root = discover_mo2_root(str(saved.get("mo2_root", "")))
+        saved_mo2_root = os.environ.get("RBB_DEFAULT_MO2", "") or str(saved.get("mo2_root", ""))
+        self.mo2_candidates = discover_mo2_candidates(saved_mo2_root)
+        mo2_root = choose_mo2_candidate(self.mo2_candidates, saved_mo2_root, APP_DIR)
         selected_profile, _game = read_mo2_ini(mo2_root) if mo2_root else ("", None)
         self.mo2_var = StringVar(value=str(mo2_root or ""))
+        self.instance_status_var = StringVar(value="Checking the installed builder location…")
         self.profile_var = StringVar(value=str(saved.get("profile", selected_profile)))
         self.template_var = StringVar(value=str(saved.get("template", "")))
+        self.skyrim_esm_var = StringVar(value=str(saved.get("skyrim_esm", "")))
         saved_output = str(saved.get("output", ""))
         configured_mods = read_mo2_directories(mo2_root).mods if mo2_root else None
         legacy_outputs = (
@@ -704,13 +689,16 @@ class ReallyBlendedBridgesBuilder(Tk):
         setup = self._card(left)
         setup.pack(fill=X, pady=(0, 12))
         self._section_heading(setup, "1", "Choose your MO2 profile", "The app reads the enabled loose-texture winners from this profile.")
-        self._field_label(setup, "MO2 instance folder")
+        self._field_label(setup, "MO2 instance")
         mo2_row = tk.Frame(setup, bg=self.CARD)
-        mo2_row.pack(fill=X, padx=18, pady=(0, 10))
-        ttk.Entry(mo2_row, textvariable=self.mo2_var).pack(side=LEFT, fill=X, expand=True)
-        ttk.Button(mo2_row, text="Choose folder", command=self.choose_mo2, style="Secondary.TButton").pack(side=LEFT, padx=(8, 0))
+        mo2_row.pack(fill=X, padx=18, pady=(0, 4))
+        self.mo2_combo = ttk.Combobox(mo2_row, textvariable=self.mo2_var, state="readonly", values=[str(path) for path in self.mo2_candidates])
+        self.mo2_combo.pack(side=LEFT, fill=X, expand=True)
+        self.mo2_combo.bind("<<ComboboxSelected>>", self.on_mo2_selected)
+        ttk.Button(mo2_row, text="Choose instance", command=self.choose_mo2, style="Secondary.TButton").pack(side=LEFT, padx=(8, 0))
+        tk.Label(setup, textvariable=self.instance_status_var, bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 8), anchor="w").pack(fill=X, padx=19, pady=(0, 8))
         profile_row = tk.Frame(setup, bg=self.CARD)
-        profile_row.pack(fill=X, padx=18, pady=(0, 14))
+        profile_row.pack(fill=X, padx=18, pady=(0, 10))
         profile_col = tk.Frame(profile_row, bg=self.CARD)
         profile_col.pack(side=LEFT, fill=X, expand=True)
         tk.Label(profile_col, text="MO2 profile", bg=self.CARD, fg=self.MUTED, font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 5))
@@ -718,6 +706,13 @@ class ReallyBlendedBridgesBuilder(Tk):
         self.profile_combo.pack(fill=X)
         self.profile_combo.bind("<<ComboboxSelected>>", lambda _event: self.auto_discover(show_dialog=False, force_template=True))
         ttk.Button(profile_row, text="Auto-detect setup", command=self.auto_discover, style="Secondary.TButton").pack(side=LEFT, padx=(8, 0), pady=(22, 0))
+
+        self._field_label(setup, "Skyrim master file (Skyrim.esm)")
+        master_row = tk.Frame(setup, bg=self.CARD)
+        master_row.pack(fill=X, padx=18, pady=(0, 12))
+        ttk.Entry(master_row, textvariable=self.skyrim_esm_var).pack(side=LEFT, fill=X, expand=True)
+        ttk.Button(master_row, text="Choose file", command=self.choose_skyrim_esm, style="Secondary.TButton").pack(side=LEFT, padx=(8, 0))
+
         ttk.Button(setup, text="▸  Advanced paths", command=self.toggle_advanced, style="Link.TButton").pack(anchor="w", padx=17, pady=(0, 10))
         self.advanced_frame = tk.Frame(setup, bg="#F8F9FB", highlightbackground=self.BORDER, highlightthickness=1)
         self._advanced_path(self.advanced_frame, "SMIM alpha template", self.template_var, self.choose_template)
@@ -851,21 +846,57 @@ class ReallyBlendedBridgesBuilder(Tk):
         candidate = Path(value) if value else None
         return candidate if candidate and candidate.is_file() else None
 
-    def auto_discover(self, show_dialog: bool = True, force_template: bool = True) -> None:
+    def current_skyrim_esm(self) -> Path | None:
+        selected = self.skyrim_esm_var.get().strip()
+        candidate = Path(selected) if selected else None
+        if candidate and candidate.is_file() and candidate.name.casefold() == "skyrim.esm":
+            return candidate
+        root = Path(self.mo2_var.get())
+        return find_skyrim_esm(root)
+
+    def _set_instance_candidates(self, candidates: list[Path]) -> None:
+        self.mo2_candidates = candidates
+        if hasattr(self, "mo2_combo"):
+            self.mo2_combo["values"] = [str(path) for path in candidates]
+
+    def _instance_status(self, root: Path) -> str:
+        directories = read_mo2_directories(root)
+        if path_is_within(APP_DIR, directories.mods):
+            return "Detected from this builder's installed location in the configured MO2 mods folder."
+        return "Using the saved or manually selected MO2 instance."
+
+    def auto_discover(self, show_dialog: bool = True, force_template: bool = True, selected_root: Path | None = None) -> None:
         self.activity_var.set("Auto-detecting MO2, SMIM, tools, and textures…")
-        current_root = self.mo2_var.get()
-        root = discover_mo2_root(current_root)
+        current_root = str(selected_root or self.mo2_var.get())
+        candidates = discover_mo2_candidates(current_root)
+        self._set_instance_candidates(candidates)
+        root = selected_root or choose_mo2_candidate(candidates, current_root, APP_DIR)
         if root:
-            changed_root = str(root).lower() != current_root.lower()
+            root = Path(os.path.normpath(root))
+            directories = read_mo2_directories(root)
+            if not (root / "ModOrganizer.ini").is_file() or not directories.profiles.is_dir() or not directories.mods.is_dir():
+                root = None
+        if root:
+            changed_root = os.path.normcase(str(root)) != os.path.normcase(self.mo2_var.get())
             self.mo2_var.set(str(root))
+            self.instance_status_var.set(self._instance_status(root))
             self.refresh_profiles()
             if changed_root or not self.output_var.get():
                 self.output_var.set(str(default_output_folder(root)))
         else:
-            self.activity_var.set("MO2 was not detected — choose its folder")
+            self.mo2_var.set("")
+            if len(candidates) > 1:
+                self.instance_status_var.set("More than one MO2 instance was found. Choose the correct instance above.")
+                self.activity_var.set("Choose the MO2 instance used for this setup")
+                detail = "More than one valid MO2 instance was found:\n\n" + "\n".join(f"• {path}" for path in candidates)
+                detail += "\n\nChoose the correct instance from the MO2 instance list."
+            else:
+                self.instance_status_var.set("No matching MO2 instance was found. Choose its instance folder manually.")
+                self.activity_var.set("MO2 was not detected — choose its instance folder")
+                detail = "Choose the MO2 instance folder containing ModOrganizer.ini."
             self.update_readiness()
             if show_dialog:
-                messagebox.showwarning("MO2 not detected", "Choose the folder containing ModOrganizer.ini, the mods folder, and the profiles folder.")
+                messagebox.showwarning("Choose an MO2 instance", detail)
             return
 
         profile = self.profile_var.get()
@@ -877,6 +908,9 @@ class ReallyBlendedBridgesBuilder(Tk):
             converter = find_texconv(root)
             if converter:
                 self.texconv_var.set(texconv_display_value(converter))
+        detected_master = find_skyrim_esm(root)
+        if detected_master:
+            self.skyrim_esm_var.set(str(detected_master))
         self.resolve_all(show_dialog=show_dialog)
 
     def save_preferences(self, show_dialog: bool = True) -> None:
@@ -887,6 +921,7 @@ class ReallyBlendedBridgesBuilder(Tk):
                     "mo2_root": self.mo2_var.get(),
                     "profile": self.profile_var.get(),
                     "template": self.template_var.get(),
+                    "skyrim_esm": self.skyrim_esm_var.get(),
                     "output": self.output_var.get(),
                     "texconv": self.texconv_var.get(),
                     "open_folder": bool(self.open_folder_var.get()),
@@ -910,18 +945,38 @@ class ReallyBlendedBridgesBuilder(Tk):
         self.destroy()
 
     def choose_mo2(self) -> None:
-        selected = filedialog.askdirectory(title="Choose the MO2 instance folder", initialdir=self.mo2_var.get() or None)
+        selected = filedialog.askdirectory(title="Choose the MO2 instance folder containing ModOrganizer.ini", initialdir=self.mo2_var.get() or None)
         if selected:
-            self.mo2_var.set(selected)
-            self.output_var.set(str(default_output_folder(Path(selected))))
-            self.refresh_profiles()
-            self.auto_discover(show_dialog=False, force_template=True)
+            selected_root = Path(selected)
+            directories = read_mo2_directories(selected_root)
+            if not (selected_root / "ModOrganizer.ini").is_file() or not directories.mods.is_dir() or not directories.profiles.is_dir():
+                messagebox.showwarning(
+                    "Not an MO2 instance folder",
+                    "That folder does not contain a usable ModOrganizer.ini with valid mods and profiles directories.",
+                )
+                return
+            self.mo2_var.set(str(selected_root))
+            self.output_var.set(str(default_output_folder(selected_root)))
+            self.auto_discover(show_dialog=False, force_template=True, selected_root=selected_root)
+
+    def on_mo2_selected(self, _event=None) -> None:
+        selected = self.mo2_var.get().strip()
+        if selected:
+            root = Path(selected)
+            self.output_var.set(str(default_output_folder(root)))
+            self.auto_discover(show_dialog=False, force_template=True, selected_root=root)
 
     def choose_template(self) -> None:
         selected = filedialog.askopenfilename(title="Choose the SMIM bridge dirt texture", filetypes=[("DDS texture", "*.dds"), ("All files", "*.*")])
         if selected:
             self.template_var.set(selected)
             self.refresh_preview()
+            self.update_readiness()
+
+    def choose_skyrim_esm(self) -> None:
+        selected = filedialog.askopenfilename(title="Choose Skyrim.esm", filetypes=[("Skyrim master", "Skyrim.esm"), ("Master files", "*.esm"), ("All files", "*.*")])
+        if selected:
+            self.skyrim_esm_var.set(selected)
             self.update_readiness()
 
     def choose_output(self) -> None:
@@ -937,7 +992,16 @@ class ReallyBlendedBridgesBuilder(Tk):
             self.update_readiness()
 
     def refresh_profiles(self) -> None:
-        root = Path(self.mo2_var.get())
+        selected_root = self.mo2_var.get().strip()
+        if not selected_root:
+            self.profile_combo["values"] = []
+            self.profile_var.set("")
+            return
+        root = Path(selected_root)
+        if not (root / "ModOrganizer.ini").is_file():
+            self.profile_combo["values"] = []
+            self.profile_var.set("")
+            return
         profiles_root = read_mo2_directories(root).profiles
         profiles = sorted(path.name for path in profiles_root.iterdir() if path.is_dir()) if profiles_root.is_dir() else []
         self.profile_combo["values"] = profiles
@@ -988,8 +1052,10 @@ class ReallyBlendedBridgesBuilder(Tk):
         self.source_detail_var.set(f"Diffuse: {pair[0]}\nNormal:  {pair[1]}" if pair else "This region is missing a loose diffuse or normal texture.")
 
     def update_readiness(self) -> bool:
-        root = Path(self.mo2_var.get())
         problems = []
+        selected_root = self.mo2_var.get().strip()
+        if not selected_root or not (Path(selected_root) / "ModOrganizer.ini").is_file():
+            problems.append("choose an MO2 instance")
         if not self.profile_var.get():
             problems.append("choose an MO2 profile")
         if len(self.winners) != len(VARIANTS):
@@ -998,7 +1064,7 @@ class ReallyBlendedBridgesBuilder(Tk):
             problems.append("locate the SMIM alpha template")
         if not self.current_texconv():
             problems.append("locate texconv.exe")
-        if not find_skyrim_esm(root):
+        if not self.current_skyrim_esm():
             problems.append("locate Skyrim.esm")
         ready = not problems
         if ready:
@@ -1123,7 +1189,9 @@ class ReallyBlendedBridgesBuilder(Tk):
             template, output, texconv = Path(self.template_var.get()), Path(self.output_var.get()), self.current_texconv()
             if not texconv:
                 raise FileNotFoundError("The bundled or selected texconv.exe could not be loaded.")
-            skyrim_esm = find_skyrim_esm(root)
+            skyrim_esm = self.current_skyrim_esm()
+            if not skyrim_esm:
+                raise FileNotFoundError("Skyrim.esm could not be located. Choose it in Step 1.")
             template_size = load_rgba(template).size
             output_texture_dir = output / OUTPUT_TEXTURE_ROOT
             self.write_log(f"Building mod:\n  {output}", clear=True)
@@ -1203,8 +1271,39 @@ def directory_resolution_self_test() -> None:
         assert default_output_folder(instance) == mods / "Really Blended Bridges"
 
 
+def location_matched_instance_self_test() -> None:
+    with tempfile.TemporaryDirectory(prefix="rbb_location_match_") as temp_name:
+        temp_root = Path(temp_name)
+        portable = temp_root / "MO2"
+        global_instance = temp_root / "AppData" / "ModOrganizer" / "Friend Instance"
+        global_mods = temp_root / "Storage" / "mods"
+        global_profiles = temp_root / "Storage" / "profiles"
+        installed_builder = global_mods / "Really Blended Bridges" / "ReallyBlendedBridgesBuilder.exe"
+
+        for directory in (portable / "mods", portable / "profiles", global_mods, global_profiles):
+            directory.mkdir(parents=True, exist_ok=True)
+        installed_builder.parent.mkdir(parents=True, exist_ok=True)
+        installed_builder.touch()
+        (portable / "ModOrganizer.ini").write_text("[General]\nselected_profile=Portable\n", encoding="utf-8")
+        global_instance.mkdir(parents=True)
+        (global_instance / "ModOrganizer.ini").write_text(
+            "[General]\nselected_profile=Global\n"
+            "[Settings]\n"
+            f"mod_directory={global_mods.as_posix()}\n"
+            f"profiles_directory={global_profiles.as_posix()}\n",
+            encoding="utf-8",
+        )
+        candidates = [portable, global_instance]
+
+        assert choose_mo2_candidate(candidates, application_dir=installed_builder.parent) == global_instance
+        unrelated_app = temp_root / "Downloads" / "Builder"
+        assert choose_mo2_candidate(candidates, application_dir=unrelated_app) is None
+        assert choose_mo2_candidate(candidates, preferred=str(portable), application_dir=unrelated_app) == portable
+
+
 def self_test() -> None:
     directory_resolution_self_test()
+    location_matched_instance_self_test()
     configured_root = os.environ.get("RBB_TEST_MO2_ROOT")
     if not configured_root:
         print("MO2 directory resolution tests passed.")
@@ -1234,7 +1333,8 @@ def self_test() -> None:
         test_plugin = temp_root / PLUGIN_NAME
         build_plugin(skyrim_esm, test_plugin)
         assert validate_plugin(test_plugin) == (5, 11)
-        converter = find_texconv(discovered_mo2)
+        configured_converter = os.environ.get("RBB_TEST_TEXCONV", "")
+        converter = Path(configured_converter) if configured_converter else find_texconv(discovered_mo2)
         assert converter and converter.is_file()
         test_dds = temp_root / "converter_test.dds"
         encode_bc3_with_mips(image, test_dds, converter)
@@ -1274,4 +1374,3 @@ if __name__ == "__main__":
         _app.destroy()
         raise SystemExit(0)
     ReallyBlendedBridgesBuilder().mainloop()
-
